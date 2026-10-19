@@ -33,11 +33,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    # Flaw #13: the container runs as root (see Dockerfile) and mounts more than it
-    # needs - the host Docker socket and the whole project tree are exposed to it.
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - .:/host
+    # No host mounts: the app needs neither the Docker socket nor the project tree.
 
 volumes:
   pgdata:

@@ -11,6 +11,8 @@ import hmac
 import time
 import base64
 import hashlib
+import ipaddress
+import re
 import subprocess
 
 import psycopg2
@@ -195,6 +197,16 @@ def login_required(role=None):
     return True
 
 
+def can_read_note(ident, note):
+    """Least privilege: only the note's student and the teacher of its class."""
+    role, user_id = ident.get("role"), ident.get("user_id")
+    if role == "student":
+        return note["student_id"] == user_id
+    if role == "teacher":
+        return note["teacher_id"] == user_id
+    return False
+
+
 # --- Routes -------------------------------------------------------------------
 @app.route("/")
 def index():
@@ -215,19 +227,21 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "")
         password = request.form.get("password", "")
-        # Flaw #8: SQL injection. Query built by string concatenation, no params.
-        query = (
-            "SELECT id, username, role FROM users "
-            "WHERE username = '" + username + "' AND password = '" + password + "'"
-        )
         conn = get_db()
         cur = conn.cursor()
         try:
-            cur.execute(query)
+            # Parameterized query: the driver sends username/password as data,
+            # so user input can never change the structure of the SQL.
+            cur.execute(
+                "SELECT id, username, role FROM users "
+                "WHERE username = %s AND password = %s",
+                (username, password),
+            )
             row = cur.fetchone()
         except Exception as e:
-            # Keep the raw error visible - helps the SQLi session.
-            error = f"Query error: {e}"
+            # Keep the details in the server log; never echo DB errors to the client.
+            log(f"login query error: {e}")
+            error = "Login failed."
             row = None
         conn.close()
         if row:
@@ -276,19 +290,20 @@ def api_notes(note_id):
         return jsonify({"error": "unauthorized"}), 401
     conn = get_db()
     cur = conn.cursor()
-    # Flaw #7 (IDOR): the owner of the note is never checked. Any authenticated
-    # caller can read any note id. Flaw #4: `ident` may come from a forged token.
+    # Flaw #4: `ident` may still come from a forged token (see verify_jwt).
     cur.execute(
         "SELECT n.id, n.student_id, n.class_id, n.grade, n.comment, "
-        "u.username AS student, c.name AS class_name "
+        "u.username AS student, c.name AS class_name, c.teacher_id "
         "FROM notes n JOIN users u ON u.id = n.student_id "
         "JOIN classes c ON c.id = n.class_id WHERE n.id = %s",
         (note_id,),
     )
     note = cur.fetchone()
     conn.close()
-    if not note:
+    # Same 404 for "missing" and "not yours", so callers can't probe which ids exist.
+    if not note or not can_read_note(ident, note):
         return jsonify({"error": "not found"}), 404
+    del note["teacher_id"]
     note["comment"] = decrypt_comment(note["comment"], note["student_id"], note["class_id"])
     note["grade"] = float(note["grade"]) if note["grade"] is not None else None
     return jsonify(note)
@@ -328,16 +343,28 @@ def grades():
     comment = request.form.get("comment", "")
     conn = get_db()
     cur = conn.cursor()
+    # A teacher may only write grades in a class they teach.
     if note_id:
         # The AAD must use the row's own student/class, not the form's dropdowns.
-        cur.execute("SELECT student_id, class_id FROM notes WHERE id = %s", (note_id,))
+        cur.execute(
+            "SELECT n.student_id, n.class_id, c.teacher_id "
+            "FROM notes n JOIN classes c ON c.id = n.class_id WHERE n.id = %s",
+            (note_id,),
+        )
         row = cur.fetchone()
-        if row:
-            cur.execute(
-                "UPDATE notes SET grade = %s, comment = %s WHERE id = %s",
-                (grade, encrypt_comment(comment, row["student_id"], row["class_id"]), note_id),
-            )
+        if not row or row["teacher_id"] != session["user_id"]:
+            conn.close()
+            abort(403)
+        cur.execute(
+            "UPDATE notes SET grade = %s, comment = %s WHERE id = %s",
+            (grade, encrypt_comment(comment, row["student_id"], row["class_id"]), note_id),
+        )
     else:
+        cur.execute("SELECT teacher_id FROM classes WHERE id = %s", (class_id,))
+        cls = cur.fetchone()
+        if not cls or cls["teacher_id"] != session["user_id"]:
+            conn.close()
+            abort(403)
         cur.execute(
             "INSERT INTO notes (student_id, class_id, grade, comment) "
             "VALUES (%s, %s, %s, %s)",
@@ -399,21 +426,39 @@ def admin():
                            ping_result=request.args.get("ping_result"))
 
 
+# Letters, digits, dots and hyphens; must start and end with a letter or digit,
+# so the value can never be read by ping as an option such as "-f".
+HOSTNAME_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
+
+
+def valid_ping_host(host):
+    """Accept only an IP literal or a plain hostname."""
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return HOSTNAME_RE.fullmatch(host) is not None
+
+
 @app.route("/admin/ping", methods=["POST"])
 def admin_ping():
-    # Flaw #11: no CSRF token. Flaw #9: command injection via os/system shell.
+    # Flaw #11: no CSRF token.
     if not login_required("admin"):
         return redirect(url_for("login"))
-    host = request.form.get("host", "")
-    # Host is concatenated straight into a shell command.
-    cmd = "ping -c 1 " + host
-    try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=10,
-        )
-        output = result.stdout + result.stderr
-    except Exception as e:
-        output = str(e)
+    host = request.form.get("host", "").strip()
+    if not valid_ping_host(host):
+        output = "Invalid host."
+    else:
+        # Argument list and no shell: characters like ; | $( ) are passed to
+        # ping as plain text instead of being run as extra commands.
+        try:
+            result = subprocess.run(
+                ["ping", "-c", "1", host],
+                capture_output=True, text=True, timeout=10,
+            )
+            output = result.stdout + result.stderr
+        except Exception as e:
+            output = str(e)
     log(f"admin ping host={host!r}")
     return render_template("admin.html", users=_all_users(), classes=_all_classes(),
                            ping_result=output)
