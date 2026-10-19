@@ -25,6 +25,9 @@ services:
       POSTGRES_PASSWORD: notesapp_pg_pw_2024
       JWT_SECRET: s3cr3t
       SECRET_KEY: dev-session-key
+      # AES-256-GCM key for notes.comment (lab 03). Generate your own with:
+      # python3 -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
+      COMMENT_KEY: 8PIZtb5IDKBFjk1XnkQlHXvkusf752LoN/sCvmzgfOk=
     ports:
       - "8080:5000"
     depends_on:

@@ -15,6 +15,8 @@ import subprocess
 
 import psycopg2
 import psycopg2.extras
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from flask import (
     Flask, request, session, redirect, url_for,
     render_template, Response, jsonify, abort,
@@ -28,6 +30,11 @@ DB_USER = os.environ.get("DB_USER", "notesapp")
 DB_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "notesapp_pg_pw_2024")
 JWT_SECRET = os.environ.get("JWT_SECRET", "s3cr3t")
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-session-key")
+# AES-256 key for the notes.comment column (base64 of 32 random bytes). No
+# default on purpose: without the key the app must not start.
+COMMENT_KEY = base64.b64decode(os.environ["COMMENT_KEY"])
+if len(COMMENT_KEY) != 32:
+    raise RuntimeError("COMMENT_KEY must be 32 bytes (base64-encoded)")
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -52,6 +59,70 @@ def get_db():
     )
     conn.autocommit = True
     return conn
+
+
+# --- Comment encryption (AES-256-GCM) -------------------------------------------
+# Stored format in notes.comment:  "v1:" + base64(nonce[12] || ciphertext || tag[16])
+# The AAD binds a ciphertext to its (student_id, class_id), so a ciphertext copied
+# onto another student's row fails authentication instead of being shown there.
+COMMENT_PREFIX = "v1:"
+
+
+def _comment_aad(student_id, class_id) -> bytes:
+    return f"notes.comment:{student_id}:{class_id}".encode()
+
+
+def encrypt_comment(plain, student_id, class_id):
+    if plain is None:
+        return None
+    nonce = os.urandom(12)  # fresh random nonce for every encryption
+    ct = AESGCM(COMMENT_KEY).encrypt(nonce, plain.encode(), _comment_aad(student_id, class_id))
+    return COMMENT_PREFIX + base64.b64encode(nonce + ct).decode()
+
+
+def decrypt_comment(stored, student_id, class_id):
+    if stored is None:
+        return None
+    if not stored.startswith(COMMENT_PREFIX):
+        # Should not happen after migrate_comments(); never show unverified data.
+        return "[unencrypted comment]"
+    try:
+        raw = base64.b64decode(stored[len(COMMENT_PREFIX):])
+        plain = AESGCM(COMMENT_KEY).decrypt(raw[:12], raw[12:], _comment_aad(student_id, class_id))
+        return plain.decode()
+    except (InvalidTag, ValueError):
+        log(f"comment integrity check failed student_id={student_id} class_id={class_id}")
+        return "[comment integrity check failed]"
+
+
+def decrypt_rows(rows):
+    for r in rows:
+        r["comment"] = decrypt_comment(r["comment"], r["student_id"], r["class_id"])
+    return rows
+
+
+def migrate_comments():
+    """Encrypt any plaintext comments left over from the seed data. Idempotent."""
+    conn = get_db()
+    conn.autocommit = False
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, student_id, class_id, comment FROM notes "
+            "WHERE comment IS NOT NULL AND comment NOT LIKE %s FOR UPDATE",
+            (COMMENT_PREFIX + "%",),
+        )
+        rows = cur.fetchall()
+        for r in rows:
+            cur.execute(
+                "UPDATE notes SET comment = %s WHERE id = %s",
+                (encrypt_comment(r["comment"], r["student_id"], r["class_id"]), r["id"]),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    if rows:
+        log(f"migrate_comments encrypted {len(rows)} plaintext comments")
 
 
 # --- Minimal JWT (deliberately weak) ------------------------------------------
@@ -188,12 +259,12 @@ def dashboard():
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT n.id, n.grade, n.comment, c.name AS class_name "
+        "SELECT n.id, n.grade, n.comment, n.student_id, n.class_id, c.name AS class_name "
         "FROM notes n JOIN classes c ON c.id = n.class_id "
         "WHERE n.student_id = %s ORDER BY c.name",
         (session["user_id"],),
     )
-    notes = cur.fetchall()
+    notes = decrypt_rows(cur.fetchall())
     conn.close()
     return render_template("dashboard.html", notes=notes, token=session.get("token"))
 
@@ -218,6 +289,7 @@ def api_notes(note_id):
     conn.close()
     if not note:
         return jsonify({"error": "not found"}), 404
+    note["comment"] = decrypt_comment(note["comment"], note["student_id"], note["class_id"])
     note["grade"] = float(note["grade"]) if note["grade"] is not None else None
     return jsonify(note)
 
@@ -237,7 +309,7 @@ def teacher():
         "FROM notes n JOIN users u ON u.id = n.student_id "
         "JOIN classes c ON c.id = n.class_id ORDER BY c.name, u.username"
     )
-    notes = cur.fetchall()
+    notes = decrypt_rows(cur.fetchall())
     cur.execute("SELECT id, username FROM users WHERE role = 'student' ORDER BY username")
     students = cur.fetchall()
     conn.close()
@@ -257,15 +329,19 @@ def grades():
     conn = get_db()
     cur = conn.cursor()
     if note_id:
-        cur.execute(
-            "UPDATE notes SET grade = %s, comment = %s WHERE id = %s",
-            (grade, comment, note_id),
-        )
+        # The AAD must use the row's own student/class, not the form's dropdowns.
+        cur.execute("SELECT student_id, class_id FROM notes WHERE id = %s", (note_id,))
+        row = cur.fetchone()
+        if row:
+            cur.execute(
+                "UPDATE notes SET grade = %s, comment = %s WHERE id = %s",
+                (grade, encrypt_comment(comment, row["student_id"], row["class_id"]), note_id),
+            )
     else:
         cur.execute(
             "INSERT INTO notes (student_id, class_id, grade, comment) "
             "VALUES (%s, %s, %s, %s)",
-            (student_id, class_id, grade, comment),
+            (student_id, class_id, grade, encrypt_comment(comment, student_id, class_id)),
         )
     conn.close()
     log(f"grade write by {session.get('username')} note_id={note_id or 'new'}")
@@ -281,7 +357,8 @@ def export_csv():
     cur = conn.cursor()
     if class_id:
         cur.execute(
-            "SELECT u.username AS student, c.name AS class, n.grade, n.comment "
+            "SELECT u.username AS student, c.name AS class, n.grade, n.comment, "
+            "n.student_id, n.class_id "
             "FROM notes n JOIN users u ON u.id = n.student_id "
             "JOIN classes c ON c.id = n.class_id WHERE n.class_id = %s "
             "ORDER BY u.username",
@@ -289,11 +366,12 @@ def export_csv():
         )
     else:
         cur.execute(
-            "SELECT u.username AS student, c.name AS class, n.grade, n.comment "
+            "SELECT u.username AS student, c.name AS class, n.grade, n.comment, "
+            "n.student_id, n.class_id "
             "FROM notes n JOIN users u ON u.id = n.student_id "
             "JOIN classes c ON c.id = n.class_id ORDER BY c.name, u.username"
         )
-    rows = cur.fetchall()
+    rows = decrypt_rows(cur.fetchall())
     conn.close()
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -390,5 +468,6 @@ def healthz():
 
 
 if __name__ == "__main__":
+    migrate_comments()
     # Plain HTTP on purpose (flaw #3). Nginx + TLS is added in a later lab.
     app.run(host="0.0.0.0", port=5000, debug=True)
