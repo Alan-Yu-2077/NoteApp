@@ -11,8 +11,14 @@ You need Docker with the Compose plugin.
 ```
 git clone git@github.com:KristenPire/NoteApp.git notesapp
 cd notesapp
+cp .env.example .env     # then fill in fresh keys (command is in the file)
 docker compose up
 ```
+
+Keys and the TLS private key are never committed: `.env` and `nginx/certs/` are
+git-ignored. For the HTTPS overlay, generate a local cert first with
+`./nginx/gen-cert.sh`. To rotate `COMMENT_KEY`, put the new key in `.env` and
+re-encrypt the stored comments with `web/rotate_comment_key.py` (usage in the file).
 
 The first start builds the image, launches PostgreSQL, and loads the seed data
 automatically. When it is ready, open:

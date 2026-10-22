@@ -9,6 +9,9 @@ __pycache__/
 venv/
 .venv/
 
-# Local env overrides
+# Local env overrides (hold the real keys; .env.example is the template)
 .env
 .env.local
+
+# TLS key and cert are generated locally by nginx/gen-cert.sh
+nginx/certs/
