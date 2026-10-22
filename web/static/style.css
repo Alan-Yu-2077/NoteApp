@@ -35,3 +35,6 @@ a.small { margin-left: .5rem; }
 .classes li { padding: .3rem 0; border-bottom: 1px solid #eef1f5; }
 pre { background: #0d1117; color: #d7e0ea; padding: .8rem; border-radius: 6px;
   overflow-x: auto; font-size: .82rem; }
+.verify { margin: .8rem 0 0; padding: .5rem .8rem; border-radius: 5px; font-weight: 600; }
+.verify-ok { background: #e3f3e8; color: #2d7d46; }
+.verify-failed { background: #fbe9e3; color: #b4461f; }

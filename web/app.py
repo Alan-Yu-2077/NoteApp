@@ -37,6 +37,13 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "dev-session-key")
 COMMENT_KEY = base64.b64decode(os.environ["COMMENT_KEY"])
 if len(COMMENT_KEY) != 32:
     raise RuntimeError("COMMENT_KEY must be 32 bytes (base64-encoded)")
+# HMAC-SHA256 key for the grades CSV export. A separate key from COMMENT_KEY,
+# and no default either.
+EXPORT_HMAC_KEY = base64.b64decode(os.environ["EXPORT_HMAC_KEY"])
+if len(EXPORT_HMAC_KEY) != 32:
+    raise RuntimeError("EXPORT_HMAC_KEY must be 32 bytes (base64-encoded)")
+if EXPORT_HMAC_KEY == COMMENT_KEY:
+    raise RuntimeError("EXPORT_HMAC_KEY must differ from COMMENT_KEY")
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -101,6 +108,31 @@ def decrypt_rows(rows):
     for r in rows:
         r["comment"] = decrypt_comment(r["comment"], r["student_id"], r["class_id"])
     return rows
+
+
+# --- Export integrity (HMAC-SHA256) -------------------------------------------
+# The CSV export ends with one extra line:  "# HMAC: " + hex(HMAC-SHA256) + "\r\n"
+# The MAC covers every byte before that line, so changing any grade, name or
+# comment (or adding / removing a row) makes the check fail.
+EXPORT_HMAC_PREFIX = b"# HMAC: "
+EXPORT_MAX_BYTES = 1024 * 1024
+
+
+def export_hmac(body: bytes) -> str:
+    # The label binds the MAC to this purpose and format version.
+    return hmac.new(EXPORT_HMAC_KEY, b"notesapp:grades-export:v1\n" + body,
+                    hashlib.sha256).hexdigest()
+
+
+def verify_export(data: bytes) -> bool:
+    idx = data.rfind(EXPORT_HMAC_PREFIX)
+    # The HMAC line must start a line of its own.
+    if idx < 0 or (idx > 0 and data[idx - 1:idx] != b"\n"):
+        return False
+    body = data[:idx]
+    tag = data[idx + len(EXPORT_HMAC_PREFIX):].strip()
+    # Constant-time comparison, so timing doesn't leak how many bytes match.
+    return hmac.compare_digest(export_hmac(body).encode(), tag)
 
 
 def migrate_comments():
@@ -313,6 +345,10 @@ def api_notes(note_id):
 def teacher():
     if not login_required("teacher"):
         return redirect(url_for("login"))
+    return _teacher_page()
+
+
+def _teacher_page(verify_result=None):
     conn = get_db()
     cur = conn.cursor()
     # A teacher sees every class (no owner scoping - broken access control).
@@ -328,7 +364,8 @@ def teacher():
     cur.execute("SELECT id, username FROM users WHERE role = 'student' ORDER BY username")
     students = cur.fetchall()
     conn.close()
-    return render_template("teacher.html", classes=classes, notes=notes, students=students)
+    return render_template("teacher.html", classes=classes, notes=notes, students=students,
+                           verify_result=verify_result)
 
 
 @app.route("/grades", methods=["POST"])
@@ -405,10 +442,25 @@ def export_csv():
     writer.writerow(["student", "class", "grade", "comment"])
     for r in rows:
         writer.writerow([r["student"], r["class"], r["grade"], r["comment"]])
+    body = buf.getvalue().encode()
+    trailer = EXPORT_HMAC_PREFIX + export_hmac(body).encode() + b"\r\n"
+    log(f"export by {session.get('username')} class_id={class_id or 'all'}")
     return Response(
-        buf.getvalue(), mimetype="text/csv",
+        body + trailer, mimetype="text/csv",
         headers={"Content-Disposition": "attachment; filename=grades.csv"},
     )
+
+
+@app.route("/export/verify", methods=["POST"])
+def export_verify():
+    """Recompute the HMAC of an uploaded export and compare it with its HMAC line."""
+    if not login_required("teacher"):
+        return redirect(url_for("login"))
+    upload = request.files.get("file")
+    data = upload.read(EXPORT_MAX_BYTES + 1) if upload else b""
+    ok = 0 < len(data) <= EXPORT_MAX_BYTES and verify_export(data)
+    log(f"export verify by {session.get('username')} result={'ok' if ok else 'FAILED'}")
+    return _teacher_page(verify_result="ok" if ok else "failed")
 
 
 @app.route("/admin")

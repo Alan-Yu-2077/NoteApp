@@ -12,6 +12,23 @@
 </div>
 
 <div class="card">
+  <h2>Verify an export</h2>
+  <p class="small">Upload a CSV exported above. The server recomputes its HMAC with
+    its secret key: any edit to the file makes the check fail.</p>
+  <form method="post" action="{{ url_for('export_verify') }}" enctype="multipart/form-data">
+    <div class="row">
+      <input type="file" name="file" accept=".csv,text/csv" required>
+      <button type="submit">Verify</button>
+    </div>
+  </form>
+  {% if verify_result == "ok" %}
+    <p class="verify verify-ok">Check passed: the file is unchanged since export.</p>
+  {% elif verify_result == "failed" %}
+    <p class="verify verify-failed">Check failed: the file was modified or has no valid HMAC.</p>
+  {% endif %}
+</div>
+
+<div class="card">
   <h2>Add / update a grade</h2>
   <form method="post" action="{{ url_for('grades') }}">
     <label>Note id (leave empty to create)
