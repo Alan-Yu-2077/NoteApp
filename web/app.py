@@ -32,7 +32,13 @@ DB_HOST = os.environ.get("DB_HOST", "db")
 DB_NAME = os.environ.get("DB_NAME", "notesapp")
 DB_USER = os.environ.get("DB_USER", "notesapp")
 DB_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "notesapp_pg_pw_2024")
-JWT_SECRET = os.environ.get("JWT_SECRET", "s3cr3t")
+# Fix #4.3 (long random secret): no weak default. A short/guessable secret
+# lets anyone forge a valid HS256 signature (we cracked "s3cr3t" offline), so
+# the app refuses to start without a long JWT_SECRET. Generate 256 bits with:
+#   python3 -c "import secrets; print(secrets.token_hex(32))"
+JWT_SECRET = os.environ["JWT_SECRET"]
+if len(JWT_SECRET) < 32:
+    raise RuntimeError("JWT_SECRET must be at least 32 characters (use a 256-bit random value)")
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-session-key")
 # AES-256 key for the notes.comment column (base64 of 32 random bytes). No
 # default on purpose: without the key the app must not start.
@@ -168,7 +174,7 @@ def migrate_comments():
         log(f"migrate_comments encrypted {len(rows)} plaintext comments")
 
 
-# --- Minimal JWT (deliberately weak) ------------------------------------------
+# --- Minimal JWT (HS256; signature required, algorithm pinned) ----------------
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
@@ -187,33 +193,40 @@ def make_jwt(payload: dict) -> str:
     return f"{h}.{p}.{_b64url(sig)}"
 
 
-def verify_jwt(token: str):
-    """Decode a JWT. Accepts alg:none (no signature) and HS256 with a short key.
+# The server pins the algorithm (fix #4.2): a token never gets to choose how it
+# is checked. We only ever verify HS256, so "alg":"none" (fix #4.1) and every
+# other value are rejected before any signature work.
+JWT_ALG = "HS256"
 
-    This is intentionally broken (flaw #4): an attacker can forge any identity
-    by setting "alg":"none", and the HS256 key is trivially guessable.
+
+def verify_jwt(token: str):
+    """Decode and verify a JWT. Return the payload only if the signature is a
+    valid HS256 MAC over this exact token; otherwise None.
+
+    The algorithm is fixed server-side (JWT_ALG) and the header's "alg" is
+    checked against it, never used to select the verification method. There is
+    no "none" path, so an unsigned token is always rejected.
     """
     try:
         h_b64, p_b64, sig_b64 = token.split(".")
     except ValueError:
+        return None
+    if not sig_b64:
+        # No signature at all (an "alg":"none" token ends in a trailing dot).
         return None
     try:
         header = json.loads(_b64url_decode(h_b64))
         payload = json.loads(_b64url_decode(p_b64))
     except Exception:
         return None
-
-    alg = header.get("alg", "").lower()
-    if alg == "none":
-        # No signature verification at all.
-        return payload
-    if alg == "hs256":
-        signing_input = f"{h_b64}.{p_b64}".encode()
-        expected = _b64url(hmac.new(JWT_SECRET.encode(), signing_input, hashlib.sha256).digest())
-        if hmac.compare_digest(expected, sig_b64):
-            return payload
+    # Pin the algorithm: reject anything that is not exactly our HS256.
+    if header.get("alg") != JWT_ALG:
         return None
-    return None
+    signing_input = f"{h_b64}.{p_b64}".encode()
+    expected = _b64url(hmac.new(JWT_SECRET.encode(), signing_input, hashlib.sha256).digest())
+    if not hmac.compare_digest(expected, sig_b64):
+        return None
+    return payload
 
 
 def current_identity():
@@ -349,7 +362,8 @@ def api_notes(note_id):
         return jsonify({"error": "unauthorized"}), 401
     conn = get_db()
     cur = conn.cursor()
-    # Flaw #4: `ident` may still come from a forged token (see verify_jwt).
+    # `ident` comes from a verified HS256 token or the session; unsigned and
+    # forged tokens are rejected in verify_jwt (flaw #4 fixed).
     cur.execute(
         "SELECT n.id, n.student_id, n.class_id, n.grade, n.comment, "
         "u.username AS student, c.name AS class_name, c.teacher_id "

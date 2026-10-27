@@ -23,7 +23,9 @@ services:
       DB_NAME: notesapp
       DB_USER: notesapp
       POSTGRES_PASSWORD: notesapp_pg_pw_2024
-      JWT_SECRET: s3cr3t
+      # Real secret lives in .env (git-ignored), never in this file: a 256-bit
+      # random value, no weak default (fix #4.3). See .env.example.
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (see .env.example)}
       SECRET_KEY: dev-session-key
       # Real keys live in .env (git-ignored), never in this file. See .env.example.
       # AES-256-GCM key for notes.comment (lab 03).
