@@ -13,6 +13,7 @@ import base64
 import hashlib
 import ipaddress
 import re
+import secrets
 import subprocess
 
 import psycopg2
@@ -55,6 +56,38 @@ if EXPORT_HMAC_KEY == COMMENT_KEY:
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+# Fix #11 (CSRF), first wall: the browser does not attach the session cookie to
+# a POST that comes from another *site*. Not enough on its own: another port on
+# the same host (localhost:9000 -> localhost:8080) is the same site, so the
+# token check below is what actually stops a forged form.
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+
+# --- CSRF token (fix #11) -----------------------------------------------------
+# One random token per session, put in every form and checked on every POST.
+# Another site can make the browser send our cookie, but it cannot read our
+# pages, so it never learns the token.
+def csrf_token():
+    if "csrf" not in session:
+        session["csrf"] = secrets.token_urlsafe(32)
+    return session["csrf"]
+
+
+app.jinja_env.globals["csrf_token"] = csrf_token
+
+
+@app.before_request
+def check_csrf():
+    # Login is exempt: there is no session, so no token, before it.
+    if request.method in ("GET", "HEAD", "OPTIONS") or request.endpoint == "login":
+        return
+    expected = session.get("csrf")
+    sent = request.form.get("csrf_token", "")
+    # Fail closed when the session has no token yet. Compare as bytes, so a
+    # non-ASCII value is a mismatch (400) rather than a TypeError (500).
+    if not expected or not hmac.compare_digest(expected.encode(), sent.encode()):
+        log(f"csrf reject {request.method} {request.path} user={session.get('username')!r}")
+        abort(400, "CSRF token missing or wrong")
 
 ph = PasswordHasher()
 
@@ -317,6 +350,8 @@ def login():
                     log(f"upgraded {row['username']} to argon2")
         conn.close()
         if authenticated:
+            # New identity, new CSRF token: never reuse one minted before login.
+            session.pop("csrf", None)
             session["user_id"] = row["id"]
             session["username"] = row["username"]
             session["role"] = row["role"]
@@ -411,7 +446,7 @@ def _teacher_page(verify_result=None):
 
 @app.route("/grades", methods=["POST"])
 def grades():
-    # Flaw #11: no CSRF token checked on this state-changing POST.
+    # CSRF token already checked in check_csrf (fix #11).
     if not login_required("teacher"):
         return redirect(url_for("login"))
     note_id = request.form.get("note_id", "").strip()
@@ -535,7 +570,7 @@ def valid_ping_host(host):
 
 @app.route("/admin/ping", methods=["POST"])
 def admin_ping():
-    # Flaw #11: no CSRF token.
+    # CSRF token already checked in check_csrf (fix #11).
     if not login_required("admin"):
         return redirect(url_for("login"))
     host = request.form.get("host", "").strip()

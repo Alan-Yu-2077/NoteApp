@@ -16,6 +16,7 @@
   <p class="small">Upload a CSV exported above. The server recomputes its HMAC with
     its secret key: any edit to the file makes the check fail.</p>
   <form method="post" action="{{ url_for('export_verify') }}" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <div class="row">
       <input type="file" name="file" accept=".csv,text/csv" required>
       <button type="submit">Verify</button>
@@ -31,6 +32,7 @@
 <div class="card">
   <h2>Add / update a grade</h2>
   <form method="post" action="{{ url_for('grades') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <label>Note id (leave empty to create)
       <input type="text" name="note_id">
     </label>
